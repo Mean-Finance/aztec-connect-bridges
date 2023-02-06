@@ -62,6 +62,7 @@ contract MeanBridge is BridgeBase, Ownable2Step {
      * @notice A function which will allow the user to create DCA positions on Mean Finance
      * @param _inputAssetA - ETH or ERC20 token to deposit and start swapping
      * @param _outputAssetA - ETH or ERC20 token to swap funds into
+     * @param _outputAssetB - Same as input asset A
      * @param _inputValue - Amount to deposit
      * @param _interactionNonce - Unique identifier for this DeFi interaction
      * @param _auxData - The amount of swaps, swap interval and wrappers encoded together
@@ -93,6 +94,60 @@ contract MeanBridge is BridgeBase, Ownable2Step {
         SUBSIDY.claimSubsidy(_criteria, _rollupBeneficiary);
         
         return (0, 0, true);
+    }
+
+    /**
+     * @notice A function which will allow the users to close their DCA positions on Mean Finance
+     * @dev Positions can only be finalised if one of the following is true:
+     *      - Position has been fully swapped
+     *      - Swaps are paused
+     *      - "From" token is no longer supported
+     *      - "To" token is no longer supported
+     * @param _outputAssetA - ETH or ERC20 token that the position had swapped funds into
+     * @param _outputAssetB - ETH or ERC20 token that had been deposited by the user
+     * @param _interactionNonce - Unique identifier for this DeFi interaction
+     * @return _outputValueA - The amount of swapped funds
+     * @return _outputValueB - The amount of unswapped funds
+     * @return _interactionComplete - This will always be true
+     */
+    function finalise(
+        AztecTypes.AztecAsset calldata _inputAssetA,
+        AztecTypes.AztecAsset calldata,
+        AztecTypes.AztecAsset calldata _outputAssetA,
+        AztecTypes.AztecAsset calldata _outputAssetB,
+        uint256 _interactionNonce,
+        uint64 _auxData
+    )
+        external
+        payable
+        virtual
+        override(BridgeBase)
+        onlyRollup
+        returns (uint256 _outputValueA, uint256 _outputValueB, bool _interactionComplete)
+    {
+        // Get tokens from assets and aux data
+        (address _from, address _to) = _getTokensFromAuxData(_inputAssetA, _outputAssetA, _auxData);
+
+        // Terminate position and clean things up
+        uint256 _positionId = positionByNonce[_interactionNonce];
+        delete positionByNonce[_interactionNonce];
+        (uint256 _unswapped, uint256 _swapped) = DCA_HUB.terminate(_positionId, THIS_ADDRESS, THIS_ADDRESS);
+
+        if (_unswapped > 0) {
+            // If there are still unswapped funds, then we will only allow users to close their DCA position 
+            // if one of the following options is met:
+            // - Swaps have been paused
+            // - One of the tokens is no longer allowed on the platform
+            if (!DCA_HUB.paused() && DCA_HUB.allowedTokens(_from) && DCA_HUB.allowedTokens(_to)) {                
+                revert MeanErrorLib.PositionStillOngoing();
+            }
+
+            _unwrapIfNeeded(_outputAssetB, _unswapped, _from, _interactionNonce, false);
+        }
+
+        _unwrapIfNeeded(_outputAssetA, _swapped, _to, _interactionNonce, true);
+        
+        return (_swapped, _unswapped, true);
     }
 
     /**
@@ -221,7 +276,9 @@ contract MeanBridge is BridgeBase, Ownable2Step {
     function _wrapIfNeeded(AztecTypes.AztecAsset memory _inputAsset, address _hubToken, uint256 _amountToWrap) internal returns (uint256 _wrappedAmount) {
         if (_inputAsset.assetType == AztecTypes.AztecAssetType.ETH) {
             WETH.deposit{value: _amountToWrap}();            
-        } else if (_inputAsset.erc20Address != _hubToken) {
+            _inputAsset.erc20Address = address(WETH);
+        } 
+        if (_inputAsset.erc20Address != _hubToken) {
             ITransformer.UnderlyingAmount[] memory _underlying = new ITransformer.UnderlyingAmount[](1);
             _underlying[0] = ITransformer.UnderlyingAmount({underlying: _inputAsset.erc20Address, amount: _amountToWrap});
             return TRANSFORMER_REGISTRY.transformToDependent(
@@ -233,6 +290,43 @@ contract MeanBridge is BridgeBase, Ownable2Step {
             );        
         }
         return _amountToWrap;
+    }
+
+    function _unwrapIfNeeded(
+        AztecTypes.AztecAsset memory _outputAsset, 
+        uint256 _amountToUnwrap, 
+        address _hubToken, 
+        uint256 _interactionNonce,
+        bool _isOutputAssetA
+    ) internal returns (uint256 _unwrappedAmount) {
+        if (_outputAsset.assetType == AztecTypes.AztecAssetType.ETH) {
+            _outputAsset.erc20Address = address(WETH);
+        }
+
+        if (_outputAsset.erc20Address != _hubToken) {
+            ITransformer.UnderlyingAmount[] memory _underlying = TRANSFORMER_REGISTRY.transformToUnderlying(
+                _hubToken, 
+                _amountToUnwrap, 
+                THIS_ADDRESS,
+                new ITransformer.UnderlyingAmount[](1), // We can't set slippage amount through Aztec, so we set the min to zero. Would be the same as calling `redeem` on a ERC4626
+                block.timestamp
+            );        
+            if (_outputAsset.erc20Address != _underlying[0].underlying) {
+                if (_isOutputAssetA) {
+                    revert ErrorLib.InvalidOutputA();
+                } else {
+                    revert ErrorLib.InvalidOutputB();
+                }
+            }
+            _amountToUnwrap = _underlying[0].amount;
+        }
+
+        if (_outputAsset.assetType == AztecTypes.AztecAssetType.ETH) {
+            WETH.withdraw(_amountToUnwrap);
+            IRollupProcessor(ROLLUP_PROCESSOR).receiveEthFromBridge{value: _amountToUnwrap}(_interactionNonce);
+        }
+
+        return _amountToUnwrap;
     }
 
     function _maxApprove(IERC20 _token, address _target) internal {
@@ -247,21 +341,25 @@ contract MeanBridge is BridgeBase, Ownable2Step {
         AztecTypes.AztecAsset memory _outputAsset,
         uint64 _auxData
     ) internal view returns (address _from, address _to, uint32 _amountOfSwaps, uint32 _swapInterval) {
+        (_from, _to) = _getTokensFromAuxData(_inputAsset, _outputAsset, _auxData);
         _amountOfSwaps = uint24(_auxData);
         _swapInterval = MeanSwapIntervalDecodingLib.calculateSwapInterval(uint8(_auxData >> 24));
+    }
+
+    function _getTokensFromAuxData(
+        AztecTypes.AztecAsset memory _inputAsset,
+        AztecTypes.AztecAsset memory _outputAsset,
+        uint64 _auxData
+    ) internal view returns (address _from, address _to) {
         _from = _mapAssetToAddress(_inputAsset, _auxData, 32);
         _to = _mapAssetToAddress(_outputAsset, _auxData, 48);
     }
 
     function _mapAssetToAddress(AztecTypes.AztecAsset memory _asset, uint64 _auxData, uint256 _shift) internal view returns(address _address) {
-        if (_asset.assetType == AztecTypes.AztecAssetType.ETH) {
-            return address(WETH);
-        } else {
-            uint256 _wrapperId = uint16(_auxData >> _shift);
-            return _wrapperId == 0 
-                ? _asset.erc20Address
-                : tokenWrapperRegistry.at(_wrapperId - 1);
-        }
+        uint256 _wrapperId = uint16(_auxData >> _shift);
+        return _wrapperId == 0 
+            ? (_asset.assetType == AztecTypes.AztecAssetType.ETH ? address(WETH) : _asset.erc20Address)
+            : tokenWrapperRegistry.at(_wrapperId - 1);
     }    
 
 }

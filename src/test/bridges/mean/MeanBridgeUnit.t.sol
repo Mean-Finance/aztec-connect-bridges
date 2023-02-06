@@ -10,6 +10,7 @@ import {ErrorLib} from "../../../bridges/base/ErrorLib.sol";
 import {MeanErrorLib} from "../../../bridges/mean/MeanErrorLib.sol";
 import {MeanSwapIntervalDecodingLib} from "../../../bridges/mean/MeanSwapIntervalDecodingLib.sol";
 import {IDCAHub} from "../../../interfaces/mean/IDCAHub.sol";
+import {ITransformer} from "../../../interfaces/mean/ITransformer.sol";
 import {ISubsidy} from "../../../aztec/interfaces/ISubsidy.sol";
 import {ITransformerRegistry} from "../../../interfaces/mean/ITransformerRegistry.sol";
 
@@ -76,6 +77,53 @@ contract MeanBridgeUnitTest is Test {
         bridge.convert(inputAssetA, emptyAsset, emptyAsset, outputAssetB, 0, 0, 0, address(0));
     }
 
+    function testInvalidCallerOnFinalise() public {
+        vm.prank(RANDOM_ADDRESS);
+        vm.expectRevert(ErrorLib.InvalidCaller.selector);
+        bridge.finalise(emptyAsset, emptyAsset, emptyAsset, emptyAsset, 0, 0);
+    }
+
+    function testRevertWithOngoingPositionOnFinalise() public {
+        vm.expectRevert(MeanErrorLib.PositionStillOngoing.selector);
+        
+        _returnOnTerminate(100, 0);
+        _setDCAPaused(false);
+        _mockIsTokenAllowed(true);
+
+        vm.prank(rollupProcessor);
+        bridge.finalise(emptyAsset, emptyAsset, emptyAsset, emptyAsset, 0, 0);
+    }   
+
+    function testRevertWithOutputAssetAOnFinalise() public {
+        // Output asset A is DAI, "to" is DAI_WRAPPER but underlying will be WETH, so revert
+        AztecTypes.AztecAsset memory _outputAssetA = _erc20Asset(address(DAI));
+        uint64 _auxData = _buildAuxData(0, 0, 0, 1);
+        _registerDAIWrapper();
+        _returnUnderlying(WETH);
+        _returnOnTerminate(0, 100);
+        _mockIsTokenAllowed(true);
+
+        vm.expectRevert(ErrorLib.InvalidOutputA.selector);
+        vm.prank(rollupProcessor);
+        bridge.finalise(emptyAsset, emptyAsset, _outputAssetA, emptyAsset, 0, _auxData);
+    }
+
+    function testRevertWithOutputAssetBOnFinalise() public {
+        // Output asset B is DAI, "from" is DAI_WRAPPER but underlying will be WETH, so revert
+        uint64 _auxData = _buildAuxData(0, 0, 1, 0);
+        _registerDAIWrapper();
+        _returnUnderlying(WETH);
+        _returnOnTerminate(100, 0);
+        _setDCAPaused(true);
+        _mockIsTokenAllowed(true);
+        
+        AztecTypes.AztecAsset memory _inputAssetA = _erc20Asset(address(DAI));
+
+        vm.expectRevert(ErrorLib.InvalidOutputB.selector);
+        vm.prank(rollupProcessor);
+        bridge.finalise(_inputAssetA, emptyAsset, emptyAsset, _inputAssetA, 0, _auxData);
+    }
+
     function testInvalidCallerOnSetSubsidies() public {        
         uint256[] memory _criteria = new uint256[](0);
         uint32[] memory _gasUsage = new uint32[](0);
@@ -122,14 +170,14 @@ contract MeanBridgeUnitTest is Test {
         
         address[] memory _tokens = new address[](1);
         _tokens[0] = address(DAI_WRAPPER);
-        _mockIsTokenAllowed(DAI_WRAPPER, false);
+        _mockIsTokenAllowed(false);
         bridge.registerWrappers(_tokens);
     }
 
     function testRevertsWhenRegisteringWrapperThatWasAlreadyRegistered() public {        
         address[] memory _tokens = new address[](1);
         _tokens[0] = address(DAI_WRAPPER);
-        _mockIsTokenAllowed(DAI_WRAPPER, true);
+        _mockIsTokenAllowed(true);
         bridge.registerWrappers(_tokens);
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -147,7 +195,7 @@ contract MeanBridgeUnitTest is Test {
         vm.expectEmit(true, false, false, false, address(bridge));
         emit NewWrappersSupported(_tokens);
         
-        _mockIsTokenAllowed(DAI_WRAPPER, true);
+        _mockIsTokenAllowed(true);
         bridge.registerWrappers(_tokens);
         
         assertEq(DAI_WRAPPER.allowance(address(bridge), address(DCA_HUB)), type(uint256).max);
@@ -208,21 +256,44 @@ contract MeanBridgeUnitTest is Test {
         assertEq(_actual, _expected);
     }
 
-    function _mockIsTokenAllowed(IERC20 _token, bool _isAllowed) internal {
+    function _mockIsTokenAllowed(bool _isAllowed) internal {
         vm.mockCall(
             address(DCA_HUB),
-            abi.encodeWithSelector(
-                DCA_HUB.allowedTokens.selector,
-                address(_token)
-            ),
+            abi.encodeWithSelector(DCA_HUB.allowedTokens.selector),
             abi.encode(_isAllowed)
+        );
+    }
+
+    function _returnOnTerminate(uint256 _unswapped, uint256 _swapped) internal {
+        vm.mockCall(
+            address(DCA_HUB),
+            abi.encodeWithSelector(DCA_HUB.terminate.selector),
+            abi.encode(_unswapped, _swapped)
+        );
+    }
+
+    function _setDCAPaused(bool _isPaused) internal {
+        vm.mockCall(
+            address(DCA_HUB),
+            abi.encodeWithSelector(DCA_HUB.paused.selector),
+            abi.encode(_isPaused)
+        );
+    }
+
+    function _returnUnderlying(IERC20 _underlying) internal {
+        ITransformer.UnderlyingAmount[] memory _underlyingArray = new ITransformer.UnderlyingAmount[](1);
+        _underlyingArray[0] = ITransformer.UnderlyingAmount(address(_underlying), 100);
+        vm.mockCall(
+            address(TRANSFORMER_REGISTRY),
+            abi.encodeWithSelector(TRANSFORMER_REGISTRY.transformToUnderlying.selector),
+            abi.encode(_underlyingArray)
         );
     }
 
     function _registerDAIWrapper() internal {
         address[] memory _tokens = new address[](1);
         _tokens[0] = address(DAI_WRAPPER);
-        _mockIsTokenAllowed(DAI_WRAPPER, true);
+        _mockIsTokenAllowed(true);
         bridge.registerWrappers(_tokens);
     }
 
