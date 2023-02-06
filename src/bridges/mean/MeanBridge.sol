@@ -129,9 +129,11 @@ contract MeanBridge is BridgeBase, Ownable2Step {
         (uint256 _unswapped, uint256 _swapped) = DCA_HUB.terminate(_positionId, THIS_ADDRESS, THIS_ADDRESS);
 
         if (_unswapped > 0) {
-            if (!DCA_HUB.paused()) {
-                // If there are still unswapped funds, then we will only allow closing the DCA position
-                // if swaps have been paused
+            // If there are still unswapped funds, then we will only allow users to close their DCA position 
+            // if one of the following options is met:
+            // - Swaps have been paused
+            // - One of the tokens is no longer allowed on the platform
+            if (!DCA_HUB.paused() && DCA_HUB.allowedTokens(_from) && DCA_HUB.allowedTokens(_to)) {                
                 revert MeanErrorLib.PositionStillOngoing();
             }
 
@@ -269,7 +271,9 @@ contract MeanBridge is BridgeBase, Ownable2Step {
     function _wrapIfNeeded(AztecTypes.AztecAsset memory _inputAsset, address _hubToken, uint256 _amountToWrap) internal returns (uint256 _wrappedAmount) {
         if (_inputAsset.assetType == AztecTypes.AztecAssetType.ETH) {
             WETH.deposit{value: _amountToWrap}();            
-        } else if (_inputAsset.erc20Address != _hubToken) {
+            _inputAsset.erc20Address = address(WETH);
+        } 
+        if (_inputAsset.erc20Address != _hubToken) {
             ITransformer.UnderlyingAmount[] memory _underlying = new ITransformer.UnderlyingAmount[](1);
             _underlying[0] = ITransformer.UnderlyingAmount({underlying: _inputAsset.erc20Address, amount: _amountToWrap});
             return TRANSFORMER_REGISTRY.transformToDependent(
@@ -291,9 +295,10 @@ contract MeanBridge is BridgeBase, Ownable2Step {
         bool _isOutputAssetA
     ) internal returns (uint256 _unwrappedAmount) {
         if (_outputAsset.assetType == AztecTypes.AztecAssetType.ETH) {
-            WETH.withdraw(_amountToUnwrap);
-            IRollupProcessor(ROLLUP_PROCESSOR).receiveEthFromBridge{value: _amountToUnwrap}(_interactionNonce);
-        } else if (_outputAsset.erc20Address != _hubToken) {
+            _outputAsset.erc20Address = address(WETH);
+        }
+
+        if (_outputAsset.erc20Address != _hubToken) {
             ITransformer.UnderlyingAmount[] memory _underlying = TRANSFORMER_REGISTRY.transformToUnderlying(
                 _hubToken, 
                 _amountToUnwrap, 
@@ -308,8 +313,14 @@ contract MeanBridge is BridgeBase, Ownable2Step {
                     revert ErrorLib.InvalidOutputB();
                 }
             }
-            return _underlying[0].amount;
+            _amountToUnwrap = _underlying[0].amount;
         }
+
+        if (_outputAsset.assetType == AztecTypes.AztecAssetType.ETH) {
+            WETH.withdraw(_amountToUnwrap);
+            IRollupProcessor(ROLLUP_PROCESSOR).receiveEthFromBridge{value: _amountToUnwrap}(_interactionNonce);
+        }
+
         return _amountToUnwrap;
     }
 
@@ -340,14 +351,10 @@ contract MeanBridge is BridgeBase, Ownable2Step {
     }
 
     function _mapAssetToAddress(AztecTypes.AztecAsset memory _asset, uint64 _auxData, uint256 _shift) internal view returns(address _address) {
-        if (_asset.assetType == AztecTypes.AztecAssetType.ETH) {
-            return address(WETH);
-        } else {
-            uint256 _wrapperId = uint16(_auxData >> _shift);
-            return _wrapperId == 0 
-                ? _asset.erc20Address
-                : tokenWrapperRegistry.at(_wrapperId - 1);
-        }
+        uint256 _wrapperId = uint16(_auxData >> _shift);
+        return _wrapperId == 0 
+            ? (_asset.assetType == AztecTypes.AztecAssetType.ETH ? address(WETH) : _asset.erc20Address)
+            : tokenWrapperRegistry.at(_wrapperId - 1);
     }    
 
 }
